@@ -46,3 +46,4 @@ EXPOSE 8000
 
 # Bind to 0.0.0.0 so the app is reachable from outside the container.
 CMD ["uvicorn", "fastapi_example:app", "--host", "0.0.0.0", "--port", "8000"]
+
