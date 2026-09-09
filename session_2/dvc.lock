@@ -9,8 +9,8 @@ stages:
       size: 431
     - path: data/raw/rides.csv
       hash: md5
-      md5: 9dcd6dac450028e57d3b46c627957982
-      size: 77804
+      md5: e1cb0d09e932ce7331f17da958cd70d7
+      size: 70630
     - path: src/config.py
       hash: md5
       md5: 2c9ece5d1b1a19799ba37520bbe08d05
@@ -22,27 +22,27 @@ stages:
     outs:
     - path: data/processed/train.parquet
       hash: md5
-      md5: 8558985e4eeaae8fab292b617bddc83d
-      size: 32913
+      md5: 48e5c98ceee9869000f24760a5045484
+      size: 30102
     - path: data/processed/val.parquet
       hash: md5
-      md5: 1fa02b607811834de557aa1b5666c985
-      size: 9915
+      md5: c6c6ebdef8f881af2b8fcac86c4efae8
+      size: 9223
   train:
     cmd: python src/train.py
     deps:
     - path: data/processed/train.parquet
       hash: md5
-      md5: 8558985e4eeaae8fab292b617bddc83d
-      size: 32913
+      md5: 48e5c98ceee9869000f24760a5045484
+      size: 30102
     - path: src/config.py
       hash: md5
       md5: 2c9ece5d1b1a19799ba37520bbe08d05
       size: 475
     - path: src/train.py
       hash: md5
-      md5: 7eb2476175929827f13d6a54d46fe375
-      size: 4625
+      md5: 8b5845918046457c0a5f893fbe2a5534
+      size: 4605
     params:
       config/config.yaml:
         model.max_depth: 6
@@ -50,19 +50,19 @@ stages:
     outs:
     - path: models/rf_model.pkl
       hash: md5
-      md5: 2c7ada194ea73a8e3140d26eb2cc2a70
-      size: 946801
+      md5: 413860cf388c1d6e38e16d6e4483edd3
+      size: 946945
   evaluate:
     cmd: python src/evaluate.py
     deps:
     - path: data/processed/val.parquet
       hash: md5
-      md5: 1fa02b607811834de557aa1b5666c985
-      size: 9915
+      md5: c6c6ebdef8f881af2b8fcac86c4efae8
+      size: 9223
     - path: models/rf_model.pkl
       hash: md5
-      md5: 2c7ada194ea73a8e3140d26eb2cc2a70
-      size: 946801
+      md5: 413860cf388c1d6e38e16d6e4483edd3
+      size: 946945
     - path: src/config.py
       hash: md5
       md5: 2c9ece5d1b1a19799ba37520bbe08d05
@@ -73,10 +73,10 @@ stages:
       size: 876
     - path: src/train.py
       hash: md5
-      md5: 7eb2476175929827f13d6a54d46fe375
-      size: 4625
+      md5: 8b5845918046457c0a5f893fbe2a5534
+      size: 4605
     outs:
     - path: metrics/scores.json
       hash: md5
-      md5: 44c73fb47334b38d7575643d967c45f2
+      md5: 0eef711432b76bb99fae6b45c780c176
       size: 89
