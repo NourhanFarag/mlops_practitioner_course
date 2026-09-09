@@ -43,6 +43,9 @@ metrics = [
     "prometheus-client>=0.20",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    # tools/traffic.py drives the API and tools/replay.py talks to it; the
+    # incident engine is unusable without a client.
+    "httpx>=0.27",
     "ride-duration-monitoring[model]",
 ]
 # LLM tracing against the Langfuse stack (`docker compose --profile langfuse up`),
@@ -62,6 +65,23 @@ llm = [
 ]
 # Backwards-compatible alias — `pip install -e ".[langfuse]"` still works.
 langfuse = ["ride-duration-monitoring[llm]"]
+# RAGAS and the custom judge (evals/). Install with:
+#   pip install -e ".[evals]"
+#
+# The langchain pins are NOT cosmetic. ragas 0.4.x imports
+# `langchain_community.chat_models.vertexai`, which no longer exists in the
+# langchain 1.x generation (langchain-community is being sunset), so the import
+# fails before any of your code runs. ragas 0.2.x against the langchain 0.3.x
+# line is the combination that actually resolves. Pin your evaluation stack as
+# tightly as you pin your model — a judge that changes is a ruler that changes.
+evals = [
+    "ragas>=0.2,<0.3",
+    "langchain>=0.3,<0.4",
+    "langchain-core>=0.3,<0.4",
+    "langchain-community>=0.3,<0.4",
+    "langchain-ollama>=0.2,<0.4",
+    "ride-duration-monitoring[llm]",
+]
 
 [build-system]
 requires = ["setuptools>=61"]

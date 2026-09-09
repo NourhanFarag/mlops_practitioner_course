@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import ollama
-from langfuse import get_client, observe, propagate_attributes
+from langfuse import Langfuse, observe, propagate_attributes
 
 # ══════════════════════════════════════════════════════════════════════
 #  Configuration
@@ -94,8 +94,45 @@ MODEL_PARAMS: dict[str, Any] = {
 USD_PER_1K_INPUT = float(os.getenv("OLLAMA_USD_PER_1K_INPUT", "0"))
 USD_PER_1K_OUTPUT = float(os.getenv("OLLAMA_USD_PER_1K_OUTPUT", "0"))
 
+# ── Masking: redact PII BEFORE it is sent, not after ──────────────────
+# Applied at the SDK boundary, so a matched value never leaves the process.
+# Redacting after ingestion is not redaction — it is deletion, and by then the
+# value has been written to ClickHouse, backed up, and possibly indexed.
+#
+# The patterns are deliberately conservative. An over-eager mask that eats the
+# answer text makes traces useless and gets switched off within a week, which
+# leaves you with no masking at all.
+_PII_PATTERNS = [
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "<EMAIL>"),
+    (re.compile(r"(?<!\d)(?:\+20|0)1[0-2,5]\d{8}(?!\d)"), "<PHONE>"),  # Egyptian mobile
+    (re.compile(r"(?<!\d)[23]\d{13}(?!\d)"), "<NATIONAL_ID>"),  # Egyptian national id
+    (re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"), "<CARD>"),
+]
+
+
+def mask_pii(data: Any) -> Any:
+    """Redact emails, phone numbers and national ids anywhere in a payload.
+
+    Passed as `Langfuse(mask=...)` at construction, so it runs on every input,
+    output and metadata value the SDK is about to send — including the ones you
+    forgot were user-controlled. Recursive, because trace payloads are nested.
+    """
+    if isinstance(data, str):
+        for pattern, replacement in _PII_PATTERNS:
+            data = pattern.sub(replacement, data)
+        return data
+    if isinstance(data, dict):
+        return {k: mask_pii(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [mask_pii(v) for v in data]
+    return data
+
+
 client = ollama.Client(host=OLLAMA_HOST)
-langfuse = get_client()
+# Constructed rather than get_client(): the mask can only be installed at
+# construction, and it is the single highest-leverage line in this file for
+# anyone who will run it against real user traffic.
+langfuse = Langfuse(mask=mask_pii)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -111,132 +148,108 @@ langfuse = get_client()
 # else in this file changes — the retrieval span is already there to receive it.
 # (Note: `ollama serve` must be started with embeddings enabled for that.)
 
-KNOWLEDGE_BASE: list[dict[str, str]] = [
-    {
-        "id": "psi",
-        "title": "Population Stability Index",
-        "text": (
-            "PSI measures how far a distribution has moved from a baseline. "
-            "Below 0.10 the population is stable and needs no action. Between "
-            "0.10 and 0.25 is a moderate shift worth investigating. Above 0.25 "
-            "is a significant shift and is the conventional trigger to retrain. "
-            "Unlike a p-value, PSI is an effect size, so it does not inflate "
-            "with sample size — which is why alert thresholds are built on it."
-        ),
-    },
-    {
-        "id": "ks",
-        "title": "Kolmogorov-Smirnov test",
-        "text": (
-            "The KS test compares two cumulative distributions and reports the "
-            "largest gap between them, as a p-value. Use it for continuous "
-            "features such as trip distance. Because it is a significance test, "
-            "a large enough sample makes even a meaningless shift come out "
-            "significant, so prefer PSI for alerting thresholds."
-        ),
-    },
-    {
-        "id": "chisquare",
-        "title": "Chi-square test",
-        "text": (
-            "The chi-square test asks whether observed category counts differ "
-            "from expected counts by more than chance allows. Use it for "
-            "low-cardinality categorical features such as passenger count."
-        ),
-    },
-    {
-        "id": "concept-drift",
-        "title": "Concept drift and online detectors",
-        "text": (
-            "Concept drift is a change in the relationship between inputs and "
-            "the target, and is invisible to input or output drift checks. It "
-            "only shows up in the error, so it needs ground truth labels. "
-            "Page-Hinkley is a cumulative sum test that catches sustained "
-            "directional shifts. ADWIN keeps an adaptive window and shrinks it "
-            "when two halves differ, reacting faster to abrupt changes."
-        ),
-    },
-    {
-        "id": "drift-order",
-        "title": "Order of detection",
-        "text": (
-            "Feature drift is observable immediately and needs no labels. "
-            "Prediction drift comes next and also needs no labels. Error drift "
-            "is the ground truth that the model is broken, but it arrives last "
-            "because labels lag predictions by hours or weeks. Monitor the "
-            "first two so you are not blind while waiting for the third."
-        ),
-    },
-    {
-        "id": "prometheus",
-        "title": "Prometheus metric types",
-        "text": (
-            "A histogram accumulates observations into buckets and only goes "
-            "up; use it for latency and predicted duration, where you want a "
-            "distribution and percentiles. A gauge is a single value that moves "
-            "both ways; use it for a PSI score recomputed each run. Never "
-            "average a latency — use histogram_quantile over the bucket series."
-        ),
-    },
-]
-
-_WORD_RE = re.compile(r"[a-z0-9]+")
-_STOPWORDS = frozenset(
-    "a an and are as at be by can do does for from how i if in is it its of on or "
-    "should that the this to use used using what when which why with you your".split()
+# The corpus itself lives in evals/knowledge_base.py — 44 notes, each written
+# in English and Arabic. It moved out of this file when session 4 added the
+# judge-calibration chapter, which needs Arabic traffic to exist before it can
+# measure how much worse a small judge is at Arabic than at English.
+from evals.knowledge_base import (  # noqa: E402
+    NOTES,
+    detect_language,
+    docs_for,
+    index_is_asymmetric,
+    index_tokens,
+    query_tokens,
 )
+
+#: The corpus in each language. A query is answered from the corpus matching its
+#: own language — mixing them would let an Arabic question retrieve English
+#: notes, which hides exactly the failure incident 09 is about.
+CORPORA: dict[str, list[dict[str, str]]] = {lang: docs_for(lang) for lang in ("en", "ar")}
+
+#: Kept under its old name: langfuse_workload.py and this module's docstring
+#: both refer to KNOWLEDGE_BASE, and English is still the default corpus.
+KNOWLEDGE_BASE: list[dict[str, str]] = CORPORA["en"]
+_N_DOCS = len(NOTES)
+
+
+def _build_index(docs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Tokenize a corpus once and precompute document frequency."""
+    tokens = {d["id"]: index_tokens(f"{d['title']} {d['text']}") for d in docs}
+    return {
+        "tokens": tokens,
+        "freq": Counter(tok for toks in tokens.values() for tok in set(toks)),
+    }
+
+
+#: Below this, a document is not considered a hit at all. See retrieve().
+MIN_RETRIEVAL_SCORE = float(os.getenv("MIN_RETRIEVAL_SCORE", "1.2"))
+
+#: Built once at import, per language.
+_INDEX: dict[str, dict[str, Any]] = {lang: _build_index(docs) for lang, docs in CORPORA.items()}
 
 
 def _tokenize(text: str) -> list[str]:
-    return [w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS]
+    """Kept for backwards compatibility — query-side tokenization."""
+    return query_tokens(text)
 
 
-# Document frequency over the corpus, computed once at import.
-_DOC_TOKENS = {d["id"]: _tokenize(f"{d['title']} {d['text']}") for d in KNOWLEDGE_BASE}
-_DOC_FREQ = Counter(tok for toks in _DOC_TOKENS.values() for tok in set(toks))
-_N_DOCS = len(KNOWLEDGE_BASE)
-
-
-def score_document(query_tokens: list[str], doc_id: str) -> float:
+def score_document(q_tokens: list[str], doc_id: str, lang: str = "en") -> float:
     """IDF-weighted overlap, length-normalised. Swap for cosine similarity."""
-    doc_counts = Counter(_DOC_TOKENS[doc_id])
+    index = _INDEX[lang]
+    doc_counts = Counter(index["tokens"][doc_id])
+    n_docs = len(index["tokens"])
     score = 0.0
-    for tok in set(query_tokens):
+    for tok in set(q_tokens):
         if tok not in doc_counts:
             continue
         # Rare words in the corpus discriminate; words in every doc do not.
-        idf = math.log((_N_DOCS + 1) / (_DOC_FREQ[tok] + 1)) + 1.0
+        idf = math.log((n_docs + 1) / (index["freq"][tok] + 1)) + 1.0
         score += idf * (1 + math.log(doc_counts[tok]))
-    return score / math.sqrt(len(_DOC_TOKENS[doc_id]) or 1)
+    return score / math.sqrt(len(index["tokens"][doc_id]) or 1)
 
 
 @observe(name="retrieve", as_type="retriever")
 def retrieve(query: str, k: int = 3) -> list[dict[str, Any]]:
-    """Fetch the k most relevant documents.
+    """Fetch the k most relevant documents, from the query's own language.
 
     `as_type="retriever"` is not cosmetic — Langfuse renders retrieval
     observations differently from generations, and being able to filter traces
     by retrieval quality is how you find out that a bad answer was actually a
     bad *retrieval*. Most "the LLM hallucinated" bugs are this.
     """
-    query_tokens = _tokenize(query)
+    lang = detect_language(query)
+    q_tokens = query_tokens(query)
+    # A retriever with no minimum score ALWAYS returns k documents, so it can
+    # never report that it failed — "no relevant documents" and "here are the
+    # three least irrelevant documents" look identical downstream, and the model
+    # answers confidently from whatever came back. A floor is what turns a bad
+    # retrieval into an observable event.
     scored = sorted(
-        ((score_document(query_tokens, d["id"]), d) for d in KNOWLEDGE_BASE),
+        ((score_document(q_tokens, d["id"], lang), d) for d in CORPORA[lang]),
         key=lambda pair: pair[0],
         reverse=True,
     )
-    hits = [{"id": d["id"], "title": d["title"], "text": d["text"], "score": round(s, 4)}
-            for s, d in scored[:k]]
+    hits = [
+        {"id": d["id"], "title": d["title"], "text": d["text"], "score": round(s, 4)}
+        for s, d in scored[:k]
+        if s >= MIN_RETRIEVAL_SCORE
+    ]
 
-    # @observe already captured the function's args and return value. This adds
-    # the numbers you'd actually alert on: a top score near zero means the
-    # retriever found nothing and the model is about to answer from memory.
+    # @observe already captured the args and the return value. This adds the
+    # numbers you would actually alert on: zero hits, or a top score near zero,
+    # means the retriever found nothing and the model is about to answer from
+    # memory. Both are recorded PER LANGUAGE, because a global retrieval metric
+    # cannot show one language collapsing while the other stays perfect.
     langfuse.update_current_span(
         metadata={
             "top_score": hits[0]["score"] if hits else 0.0,
             "retrieved_ids": [h["id"] for h in hits],
-            "corpus_size": _N_DOCS,
+            "n_hits": len(hits),
+            "zero_hits": not hits,
+            "lang": lang,
+            "corpus_size": len(CORPORA[lang]),
             "retriever": "tfidf-lexical",
+            "index_asymmetric": index_is_asymmetric(),
         }
     )
     return hits
@@ -269,8 +282,9 @@ def _cost_from_usage(usage: dict[str, int]) -> dict[str, float]:
     return {
         "input": usage["input"] / 1000 * USD_PER_1K_INPUT,
         "output": usage["output"] / 1000 * USD_PER_1K_OUTPUT,
-        "total": (usage["input"] / 1000 * USD_PER_1K_INPUT
-                  + usage["output"] / 1000 * USD_PER_1K_OUTPUT),
+        "total": (
+            usage["input"] / 1000 * USD_PER_1K_INPUT + usage["output"] / 1000 * USD_PER_1K_OUTPUT
+        ),
     }
 
 
@@ -357,23 +371,47 @@ Context:
 
 Question: {{question}}"""
 
+#: Incident 07. The same prompt with the grounding sentence removed and a
+#: friendlier tone — the kind of edit that gets made because the answers "read
+#: better", by someone who has never seen a faithfulness chart. Nothing else
+#: changes: no code, no deploy, no restart, so the deploy timeline stays empty
+#: and the only trace of the change is the prompt version on each generation.
+DEGRADED_PROMPT_TEXT = """You are a friendly monitoring assistant for an ML
+platform team. Answer the question below, keeping it warm and helpful.
+
+Context:
+{{context}}
+
+Question: {{question}}"""
+
 
 def ensure_prompt() -> Any:
-    """Fetch the production prompt, creating it on first run.
+    """Fetch the prompt carrying the production label, creating it on first run.
 
     `label="production"` is the indirection that matters: this code never names
     a version number, so promoting a new prompt is a label move in the UI, not a
-    code change.
+    code change. That is also precisely why incident 07 is hard to find — the
+    label below is the ONLY thing that changes, and it leaves no deploy row.
     """
+    from incidents import state
+
+    label = state.flag("PROMPT_PRODUCTION_LABEL") or "production"
     try:
-        return langfuse.get_prompt(PROMPT_NAME, label="production", cache_ttl_seconds=60)
+        return langfuse.get_prompt(PROMPT_NAME, label=label, cache_ttl_seconds=60)
     except Exception:
+        # First run for this label. "degraded" is created on demand so incident
+        # 07 works on a fresh instance without a separate seeding step.
+        is_degraded = label != "production"
         return langfuse.create_prompt(
             name=PROMPT_NAME,
-            prompt=PROMPT_TEXT,
+            prompt=DEGRADED_PROMPT_TEXT if is_degraded else PROMPT_TEXT,
             type="text",
-            labels=["production"],
-            commit_message="Initial version from ollama_langfuse_rag.py",
+            labels=[label],
+            commit_message=(
+                "Softer tone, grounding instruction dropped"
+                if is_degraded
+                else "Initial version from ollama_langfuse_rag.py"
+            ),
         )
 
 
@@ -391,20 +429,27 @@ def rag_pipeline(question: str) -> dict[str, Any]:
     whole value: when an answer is wrong you can see whether retrieval missed,
     the prompt was malformed, or the model ignored good context.
     """
-    docs = retrieve(question, k=3)
+    # Tag the whole trace with the question's language. Every quality number in
+    # this repo is reported per language, and that is only possible if the tag
+    # is on the trace at write time — you cannot retrofit a dimension onto
+    # traces you have already collected. propagate_attributes WRAPS the work
+    # because it applies to spans created inside the block.
+    lang = detect_language(question)
+    with propagate_attributes(tags=[f"lang:{lang}"], metadata={"lang": lang}):
+        docs = retrieve(question, k=3)
 
-    prompt_client = ensure_prompt()
-    context = "\n\n".join(f"[{d['id']}] {d['title']}: {d['text']}" for d in docs)
-    compiled = prompt_client.compile(context=context, question=question)
+        prompt_client = ensure_prompt()
+        context = "\n\n".join(f"[{d['id']}] {d['title']}: {d['text']}" for d in docs)
+        compiled = prompt_client.compile(context=context, question=question)
 
-    response = chat(
-        [{"role": "user", "content": compiled}],
-        name="generate-answer",
-        prompt=prompt_client,  # links trace → prompt version
-    )
-    answer = response.message.content.strip()
+        response = chat(
+            [{"role": "user", "content": compiled}],
+            name="generate-answer",
+            prompt=prompt_client,  # links trace → prompt version
+        )
+        answer = response.message.content.strip()
 
-    return {"question": question, "answer": answer, "docs": docs}
+    return {"question": question, "answer": answer, "docs": docs, "lang": lang}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -625,8 +670,12 @@ def judge_answer(question: str, answer: str, docs: list[dict[str, Any]]) -> dict
     """
     context = "\n\n".join(f"[{d['id']}] {d['text']}" for d in docs)
     response = chat(
-        [{"role": "user", "content": JUDGE_TEMPLATE.format(
-            context=context, question=question, answer=answer)}],
+        [
+            {
+                "role": "user",
+                "content": JUDGE_TEMPLATE.format(context=context, question=question, answer=answer),
+            }
+        ],
         name="judge-generation",
         model=JUDGE_MODEL,
         fmt="json",
@@ -753,8 +802,10 @@ def demo_rag(question: str) -> None:
 
     verdict = judge_answer(question, result["answer"], result["docs"])
     attach_scores(result, verdict)
-    print(f"   judge: faithfulness={verdict['faithfulness']} "
-          f"relevance={verdict['relevance']} — {verdict['reason']}")
+    print(
+        f"   judge: faithfulness={verdict['faithfulness']} "
+        f"relevance={verdict['relevance']} — {verdict['reason']}"
+    )
 
     # In a real app this is a thumbs-up/down from the UI, arriving seconds or
     # hours later. It's the score that matters most, because it's the only one
