@@ -1,0 +1,68 @@
+# Quality gate for the RAG service. Runs when the retrieval/generation path or a
+# prompt changes — the two things that move faithfulness without moving a test.
+#
+# Why this exists as a separate workflow from ci.yml: a unit test answers "does
+# it run?", and this answers "is it still any good?". They fail for different
+# reasons, they take very different amounts of time, and mixing them means the
+# slow one gets disabled the first week someone is in a hurry.
+name: eval-gate
+
+on:
+  pull_request:
+    paths:
+      - "session_4/ollama_langfuse_rag.py"
+      - "session_4/evals/**"
+      - "session_4/langfuse_workload.py"
+  workflow_dispatch:
+
+jobs:
+  ragas-gate:
+    runs-on: ubuntu-latest
+    # An 8B judge over 60 items is not a two-minute job. Budget for it honestly
+    # rather than discovering the default 6h timeout at 2am.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # <3.13: the evidently<0.7 pin the rest of the session depends on is
+          # not published for 3.13+. See pyproject.toml.
+          python-version: "3.12"
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          # --embeddings, because ResponseRelevancy needs them and a server
+          # started without it answers 501 and silently drops that metric.
+          OLLAMA_HOST=0.0.0.0 ollama serve --embeddings &
+          for i in $(seq 1 30); do curl -sf http://localhost:11434/api/tags && break; sleep 2; done
+
+      - name: Pull the judge model
+        # Pinned by full tag. A bare `llama3.1` is a moving alias, and a judge
+        # that changes underneath you invalidates every comparison to an
+        # earlier run — the provider-drift problem, self-inflicted.
+        run: ollama pull llama3.1:8b
+
+      - name: Install the evaluation stack
+        working-directory: session_4
+        run: pip install -e ".[evals]"
+
+      - name: Verify the testset has not drifted
+        working-directory: session_4
+        # The gate compares runs over time. If the testset changed, a score
+        # movement could be the model or could be the test, and nobody can tell
+        # which — so the loader refuses rather than reporting an incomparable number.
+        run: python -m evals.build_testset --stats
+
+      - name: Run the gate
+        working-directory: session_4
+        env:
+          OLLAMA_HOST: http://localhost:11434
+          OLLAMA_MODEL: llama3.1:8b
+          OLLAMA_NUM_CTX: "8192"
+          # Match OLLAMA_NUM_PARALLEL: more workers split the KV cache and stall
+          # on long Arabic contexts rather than going faster.
+          RAGAS_MAX_WORKERS: "2"
+        run: python -m evals.run_ragas --source dataset --gate --threshold 0.70
