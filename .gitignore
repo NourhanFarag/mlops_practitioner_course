@@ -19,3 +19,20 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+# Secrets
+.env
+.env.*
+credentials/
+*.key
+*.pem
+
+# Raw/local data
+data/
+
+# Terraform state
+*.tfstate
+*.tfstate.*
+
+
+
