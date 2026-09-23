@@ -16,15 +16,13 @@
 #     pre-commit autoupdate
 
 repos:
-  # ── Ruff: linter + formatter (Rust-fast, replaces flake8 + Black + isort) ──
+  # ── Ruff: linter ──
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.4.4
     hooks:
       - id: ruff              # the LINTER: flags unused imports, bad style, bugs
         args: [--fix]         # auto-fix what it safely can; commit aborts if it
                               # changed files so you can review + re-stage them
-      - id: ruff-format       # the FORMATTER: reflows code to a consistent style
-                              # (indentation, quotes, line length) — like Black
 
   # ── Generic hygiene hooks maintained by the pre-commit project ─────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -68,6 +66,12 @@ repos:
   # rootdir (testpaths = ["tests"] in session_2/pyproject.toml).
   - repo: local
     hooks:
+      - id: black
+        name: black
+        entry: black
+        language: system
+        types: [python]
+
       - id: pytest
         name: pytest (run the session_2 test suite)
         entry: bash -c 'cd session_2 && pytest'
